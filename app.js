@@ -225,6 +225,128 @@
     return out;
   }
 
+  /* ============ Mục tiêu & huấn luyện viên ============ */
+  // [typeId, hướng, mức (phút hoặc lần), tên gợi ý]
+  const GOAL_PRESETS = [
+    ['sleep', 'min', 480, 'Ngủ đủ 8 tiếng'],
+    ['exercise', 'min', 60, 'Vận động 60 phút'],
+    ['study', 'min', 30, 'Học 30 phút'],
+    ['read', 'min', 20, 'Đọc sách 20 phút'],
+    ['phone', 'max', 120, 'Lướt mạng tối đa 2 tiếng'],
+    ['water', 'min', 8, 'Uống nước 8 lần'],
+    ['coffee', 'max', 2, 'Cà phê tối đa 2 ly'],
+  ];
+  const r5 = m => Math.max(5, Math.round(m / 5) * 5);
+  const hm = m => { m = ((Math.round(m) % 1440) + 1440) % 1440; return `${Math.floor(m / 60)}h${pad(m % 60)}`; };
+  const minuteOfDay = t => { const d = new Date(t); return d.getHours() * 60 + d.getMinutes(); };
+  const isNightSleep = t => t && t.kind === 'duration' && (t.id === 'sleep' || /giấc ngủ|ngủ đêm/i.test(t.name));
+  const goalType = g => typeById(g.typeId);
+  const isDurGoal = g => (goalType(g) || {}).kind !== 'instant';
+  const fmtGoal = (g, v) => isDurGoal(g) ? fmtShort(Math.max(0, Math.round(v)) * 60000) : `${Math.round(v)} lần`;
+  const goalMet = (g, v) => g.dir === 'min' ? v >= g.target - 0.5 : v <= g.target + 0.01;
+  const goalLabel = g => `${g.dir === 'min' ? 'Ít nhất' : 'Tối đa'} ${fmtGoal(g, g.target)} / ngày`;
+
+  // Giá trị của một loại trong một ngày.
+  // Hoạt động có thời gian được tính trọn vào ngày chứa "điểm giữa" của nó,
+  // nên giấc ngủ 23h → 7h được tính cho ngày thức dậy.
+  function dayValue(typeId, d0, now = Date.now()) {
+    const d1 = addDays(d0, 1);
+    let v = 0;
+    for (const e of db.entries) {
+      if (e.typeId !== typeId) continue;
+      if (e.k === 'i') { if (e.start >= d0 && e.start < d1) v++; continue; }
+      const end = e.end === null ? now : e.end;
+      const mid = (e.start + end) / 2;
+      if (mid >= d0 && mid < d1) v += (end - e.start) / 60000;
+    }
+    return v;
+  }
+  function hasDataOn(d0) {
+    const d1 = addDays(d0, 1);
+    return db.entries.some(e => e.start < d1 && (e.k === 'i' ? e.start >= d0 : (e.end === null || e.end > d0)));
+  }
+  function goalStreak(g, fromDay, wantMet) {
+    let n = 0;
+    for (let d = fromDay; n < 366; d = addDays(d, -1)) {
+      if (!hasDataOn(d)) break;
+      if (goalMet(g, dayValue(g.typeId, d)) !== wantMet) break;
+      n++;
+    }
+    return n;
+  }
+  function typicalWake(t) {
+    const from = addDays(startOfDay(Date.now()), -14);
+    const ends = db.entries.filter(e => e.typeId === t.id && e.k === 'd' && e.end !== null && e.end >= from)
+      .map(e => minuteOfDay(e.end)).sort((a, b) => a - b);
+    return ends.length ? ends[Math.floor(ends.length / 2)] : null;
+  }
+  function peakHour(t, from, to) {
+    const h = hourDistribution(t, from, to);
+    const max = Math.max(...h);
+    return max > 0 ? h.indexOf(max) : null;
+  }
+
+  // Nhìn lại một mục tiêu của ngày hôm qua, đưa ra lời khuyên và mức gợi ý cho hôm nay
+  function coachItem(g, yd) {
+    const t = goalType(g);
+    if (!t) return null;
+    const v = dayValue(g.typeId, yd);
+    const f = x => fmtGoal(g, x);
+    const dur = t.kind === 'duration';
+    const met = goalMet(g, v);
+    let text, suggest = g.target, status = met ? 'ok' : (g.dir === 'min' ? 'miss' : 'over');
+
+    if (met) {
+      const s = goalStreak(g, yd, true);
+      text = g.dir === 'min' ? `Đạt ${f(v)} / ${f(g.target)}` : `${f(v)}, trong mức tối đa ${f(g.target)}`;
+      text += s >= 2 ? ` · ${s} ngày liên tiếp 🔥` : ' 👍';
+    } else if (g.dir === 'min') {
+      const gap = g.target - v;
+      const misses = goalStreak(g, yd, false);
+      text = v < 1 ? `Hôm qua chưa có ${t.name.toLowerCase()}.` : `${f(v)} / ${f(g.target)}, thiếu ${f(gap)}.`;
+      if (isNightSleep(t)) {
+        const wake = typicalWake(t);
+        text += wake != null
+          ? ` Bạn hay dậy lúc ${hm(wake)}, tối nay nên lên giường trước ${hm(wake - g.target - 15)}. Đừng ngủ nướng để bù.`
+          : ' Tối nay thử đi ngủ sớm hơn 30–60 phút thay vì ngủ nướng để bù.';
+      } else if (misses >= 3) {
+        suggest = dur ? r5(g.target * 0.6) : Math.max(1, Math.round(g.target * 0.6));
+        text += ` ${misses} ngày liền chưa đạt, đừng dồn bù. Hôm nay hạ tạm còn ${f(suggest)} để giữ nhịp, đều rồi tăng lại.`;
+      } else if (dur) {
+        const extra = r5(Math.min(gap, g.target * 0.5));
+        suggest = g.target + extra;
+        const peak = peakHour(t, addDays(yd, -29), addDays(yd, 1));
+        text += ` Hôm nay thử ${f(suggest)} (bù ${f(extra)})`;
+        if (suggest >= 60) text += `, chia 2 lần ${f(r5(suggest / 2))}`;
+        if (peak != null) text += `, vào khoảng ${peak}h như bạn hay làm`;
+        text += '.';
+      } else {
+        const every = Math.max(1, Math.round(16 / g.target));
+        text += ` Hôm nay rải đều, khoảng ${every} tiếng một lần.`;
+      }
+    } else {
+      const over = v - g.target;
+      text = `${f(v)}, vượt ${f(over)} so với mức tối đa ${f(g.target)}.`;
+      if (dur) {
+        const longest = db.entries.filter(e => e.typeId === t.id && e.k === 'd' && e.end !== null && startOfDay((e.start + e.end) / 2) === yd)
+          .sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
+        if (longest) text += ` Lâu nhất là lúc ${fmtTime(longest.start)}–${fmtTime(longest.end)}, hôm nay thử tránh khung giờ đó.`;
+        suggest = r5(g.target - Math.min(over, g.target * 0.25));
+        text += ` Giữ dưới ${f(suggest)} hôm nay để cân lại.`;
+      } else {
+        const last = db.entries.filter(e => e.typeId === t.id && e.k === 'i' && e.start >= yd && e.start < addDays(yd, 1))
+          .reduce((m, e) => Math.max(m, e.start), 0);
+        if (last) text += ` Lần cuối lúc ${fmtTime(last)}.`;
+        if (last && /cà phê|coffee|trà/i.test(t.name) && minuteOfDay(last) >= 14 * 60) text += ' Uống sau 14h dễ làm khó ngủ, hôm nay thử dừng trước 14h.';
+        else text += ` Hôm nay giữ trong ${f(g.target)} nhé.`;
+      }
+    }
+    return { g, t, v, met, status, text, suggest };
+  }
+  function coachFor(yd) {
+    return db.goals.map(g => coachItem(g, yd)).filter(Boolean);
+  }
+
   /* ============ Trạng thái giao diện ============ */
   const state = {
     tab: ['log', 'timeline', 'calendar', 'stats'].includes(ui.tab) ? ui.tab : 'log',
@@ -233,6 +355,7 @@
     calDay: startOfDay(Date.now()),
     tlDays: 7,
     renderedDay: startOfDay(Date.now()),
+    coachSeen: typeof ui.coachSeen === 'number' ? ui.coachSeen : null,
   };
 
   /* ============ Hành động ============ */
@@ -299,7 +422,26 @@
     const elapsed = now - d0;
 
     let h = `<header class="page-head"><div><h1>Hôm nay</h1><p class="sub">${esc(fmtDayLong(now))}</p></div>
-      <button class="round-btn" data-act="types" aria-label="Quản lý loại hoạt động">${ICON_SLIDERS}</button></header>`;
+      <div class="head-actions"><button class="round-btn" data-act="goals" aria-label="Mục tiêu">🎯</button>
+      <button class="round-btn" data-act="types" aria-label="Quản lý loại hoạt động">${ICON_SLIDERS}</button></div></header>`;
+
+    // --- Nhìn lại hôm qua
+    const yd = addDays(d0, -1);
+    const plan = new Map();
+    if (db.goals.length && hasDataOn(yd)) {
+      const items = coachFor(yd);
+      items.forEach(it => plan.set(it.g.id, it));
+      const okCount = items.filter(it => it.met).length;
+      if (state.coachSeen === d0) {
+        h += `<button class="coach-mini" data-act="coachOpen"><span>🌤️ Nhìn lại hôm qua</span><b>đạt ${okCount}/${items.length}</b><span class="chev" aria-hidden="true">›</span></button>`;
+      } else {
+        h += `<section class="coach" aria-label="Nhìn lại hôm qua">
+          <div class="coach-head"><span>🌤️ Nhìn lại hôm qua</span><b>Đạt ${okCount}/${items.length} mục tiêu</b></div>
+          <ul class="coach-list">${items.map(it => `<li class="${it.status}"><span class="avatar sm" style="--c:${it.t.color}">${it.t.emoji}</span>
+            <p><b>${esc(it.t.name)}:</b> ${esc(it.text)}</p></li>`).join('')}</ul>
+          <button class="coach-done" data-act="coachDone">Đã hiểu 👌</button></section>`;
+      }
+    }
 
     if (cur) {
       const t = typeOf(cur);
@@ -317,6 +459,47 @@
     h += `<div class="today-card">
       <div class="today-top"><span>Đã ghi lại <strong class="num">${fmtShort(tracked)}</strong></span><span class="num">/ ${fmtShort(elapsed)} đã trôi qua</span></div>
       <div class="stack" role="img" aria-label="Đã ghi ${fmtDur(tracked)} trên ${fmtDur(elapsed)} của hôm nay">${segs}</div></div>`;
+
+    // --- Mục tiêu hôm nay
+    if (db.goals.length) {
+      h += `<h2 class="section-title">🎯 Mục tiêu hôm nay <button class="hint link-btn" data-act="goals">Sửa</button></h2><div class="card">`;
+      h += db.goals.map(g => {
+        const t = goalType(g);
+        if (!t) return '';
+        const v = dayValue(g.typeId, d0, now);
+        const p = plan.get(g.id);
+        const target = p ? p.suggest : g.target;
+        const f = x => fmtGoal(g, x);
+        let sub, right = '', cls = '';
+        if (g.dir === 'min' && isNightSleep(t)) {
+          const done = v >= g.target - 0.5;
+          const sleeping = running() && running().typeId === t.id;
+          sub = `${goalLabel(g)} · ${sleeping ? 'đang ngủ' : (done ? 'đêm qua đủ giấc' : `đêm qua thiếu ${f(g.target - v)}`)}`;
+          right = done ? '<span class="badge-ok">✓</span>' : '';
+          cls = done ? 'done' : '';
+        } else if (g.dir === 'min') {
+          const done = v >= target - 0.5;
+          sub = target !== g.target ? `Gợi ý hôm nay ${f(target)} <span class="muted">(mục tiêu ${f(g.target)})</span>` : goalLabel(g);
+          if (!done) sub += ` · còn ${f(target - v)}`;
+          right = done ? '<span class="badge-ok">✓</span>' : '';
+          cls = done ? 'done' : '';
+        } else {
+          const over = v > target + 0.01;
+          sub = target !== g.target ? `Hôm nay tối đa ${f(target)} <span class="muted">(mức ${f(g.target)})</span>` : goalLabel(g);
+          sub += over ? ` · vượt ${f(v - target)}` : ` · còn ${f(target - v)}`;
+          cls = over ? 'over' : '';
+        }
+        const pct = Math.min(100, (v / (isNightSleep(t) ? g.target : target)) * 100);
+        return `<div class="row-static goal-row ${cls}"><span class="avatar" style="--c:${t.color}">${t.emoji}</span>
+          <span class="row-main"><span class="row-title">${esc(t.name)}</span><span class="row-sub">${sub}</span>
+          <span class="mini-bar" style="--c:${t.color}"><i style="width:${pct}%"></i></span></span>
+          <span class="row-right"><strong class="num">${f(v)}</strong>${right}</span></div>`;
+      }).join('') + `</div>`;
+    } else {
+      h += `<button class="goal-cta" data-act="goals"><span class="goal-cta-icon">🎯</span>
+        <span><b>Đặt mục tiêu mỗi ngày</b><small>Ví dụ: ngủ 8 tiếng, vận động 60 phút, học 30 phút. Mỗi sáng app sẽ nhìn lại hôm qua và gợi ý cho hôm nay.</small></span>
+        <span class="chev" aria-hidden="true">›</span></button>`;
+    }
 
     if (!enabled.length) {
       h += `<div class="empty"><b>🫙</b>Chưa có loại hoạt động nào được bật.<br><button class="link-btn" data-act="types">Bật hoặc thêm hoạt động</button></div>`;
@@ -486,6 +669,26 @@
       `<button data-act="range" data-r="${v}" aria-pressed="${state.range === v}">${l}</button>`).join('');
     let h = `<header class="page-head"><div><h1>Thống kê</h1></div></header><div class="seg" role="group" aria-label="Khoảng thời gian">${seg}</div>`;
     if (!db.entries.length) return h + `<div class="empty"><b>📊</b>Ghi lại vài ngày, thống kê sẽ hiện ở đây.</div>`;
+
+    // --- Mục tiêu
+    if (db.goals.length) {
+      const today = startOfDay(Date.now());
+      const dayList = [];
+      for (let d = from; d < today; d = addDays(d, 1)) if (hasDataOn(d)) dayList.push(d);
+      if (dayList.length) {
+        h += `<h2 class="section-title">🎯 Mục tiêu <span class="hint">không tính hôm nay</span></h2><div class="card">` + db.goals.map(g => {
+          const t = goalType(g);
+          if (!t) return '';
+          const vals = dayList.map(d => dayValue(g.typeId, d));
+          const met = vals.filter(v => goalMet(g, v)).length;
+          const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+          return `<div class="row-static"><span class="avatar" style="--c:${t.color}">${t.emoji}</span>
+            <span class="row-main"><span class="row-title">${esc(t.name)}</span><span class="row-sub">${goalLabel(g)} · trung bình ${fmtGoal(g, avg)}</span>
+            <span class="mini-bar" style="--c:${met / vals.length >= 0.7 ? 'var(--ok)' : t.color}"><i style="width:${(met / vals.length) * 100}%"></i></span></span>
+            <span class="row-right"><span class="accent num">${met}/${vals.length}</span><small>ngày đạt</small></span></div>`;
+        }).join('') + `</div>`;
+      }
+    }
 
     // --- Có thời gian
     const totals = sortedByValue(durTotals(from, to));
@@ -697,6 +900,108 @@
     });
   }
 
+  /* ---- Mục tiêu ---- */
+  function goalDots(g) {
+    const today = startOfDay(Date.now());
+    let met = 0, counted = 0, dots = '';
+    for (let i = 7; i >= 1; i--) {
+      const d = addDays(today, -i);
+      const label = fmtDayShort(d);
+      if (!hasDataOn(d)) { dots += `<i class="dot none" title="${label}: chưa ghi"></i>`; continue; }
+      const ok = goalMet(g, dayValue(g.typeId, d));
+      counted++; if (ok) met++;
+      dots += `<i class="dot ${ok ? 'ok' : 'miss'}" title="${label}: ${ok ? 'đạt' : 'chưa đạt'}"></i>`;
+    }
+    return `<span class="dots" aria-label="7 ngày qua: đạt ${met} trên ${counted} ngày có ghi">${dots}<small>${counted ? `${met}/${counted}` : ''}</small></span>`;
+  }
+
+  function openGoalsSheet() {
+    const rows = db.goals.map(g => {
+      const t = goalType(g) || { name: '(Đã xóa)', emoji: '❔', color: '#8e8e93' };
+      return `<div class="row-static">
+        <button type="button" class="type-name" data-edit-goal="${esc(g.id)}"><span class="avatar" style="--c:${t.color}">${t.emoji}</span>
+          <span class="row-main"><span class="row-title">${esc(t.name)}</span><span class="row-sub">${goalLabel(g)}</span>${goalDots(g)}</span></button>
+        <span class="chev" aria-hidden="true">›</span></div>`;
+    }).join('');
+    const presets = GOAL_PRESETS.filter(([tid]) => typeById(tid) && !db.goals.some(g => g.typeId === tid))
+      .map(([tid, , , label]) => `<button type="button" class="chip chip-btn" data-preset="${tid}">${typeById(tid).emoji} ${esc(label)}</button>`).join('');
+    const body = `<p class="note" style="padding:0 4px 12px">Mỗi sáng app sẽ nhìn lại hôm qua: đạt thì giữ chuỗi 🔥, chưa đạt thì gợi ý cách bù hợp lý cho hôm nay.</p>
+      ${rows ? `<div class="card">${rows}</div>` : ''}
+      ${presets ? `<h2 class="section-title">Thêm nhanh</h2><div class="card"><div class="chips">${presets}</div></div>` : ''}
+      <div class="btn-row"><button class="btn primary" data-new-goal>＋ Mục tiêu khác</button></div>
+      <p class="note" style="padding:14px 4px 0">Đây là gợi ý về thói quen, không phải lời khuyên y tế. Nếu thấy mệt mỏi hay mất ngủ kéo dài, hãy đi khám.</p>`;
+    openSheet('Mục tiêu mỗi ngày', body, sheet => {
+      sheet.addEventListener('click', ev => {
+        const b = ev.target.closest('button');
+        if (!b) return;
+        if (b.dataset.preset) {
+          const p = GOAL_PRESETS.find(x => x[0] === b.dataset.preset);
+          db.goals.push({ id: uid(), typeId: p[0], dir: p[1], target: p[2] });
+          const t = typeById(p[0]);
+          if (t && !t.enabled) t.enabled = true;
+          save(); render(); openGoalsSheet();
+          toast(`🎯 Đã thêm: ${p[3]}`);
+        } else if (b.dataset.editGoal) openGoalForm(db.goals.find(g => g.id === b.dataset.editGoal));
+        else if (b.hasAttribute('data-new-goal')) openGoalForm(null);
+      });
+    });
+  }
+
+  function openGoalForm(goal) {
+    const isNew = !goal;
+    const cur = goal || { typeId: (db.types.find(t => t.enabled) || db.types[0] || {}).id, dir: 'min', target: 30 };
+    const opts = db.types.map(t => `<option value="${esc(t.id)}" ${t.id === cur.typeId ? 'selected' : ''}>${t.emoji} ${esc(t.name)} ${t.kind === 'duration' ? '⏱' : '⚡'}</option>`).join('');
+    const body = `<form id="goal-form" novalidate>
+      <label class="field"><span>Hoạt động</span><select class="input" name="type">${opts}</select></label>
+      <div class="field"><span>Kiểu mục tiêu</span><div class="radio-row">
+        <label><input type="radio" name="dir" value="min" ${cur.dir === 'min' ? 'checked' : ''}><span><b>Ít nhất</b>Muốn làm nhiều hơn (ngủ, học, tập…)</span></label>
+        <label><input type="radio" name="dir" value="max" ${cur.dir === 'max' ? 'checked' : ''}><span><b>Tối đa</b>Muốn hạn chế (lướt mạng, cà phê…)</span></label>
+      </div></div>
+      <div class="field" data-dur><span>Mỗi ngày</span><div class="amount">
+        <input class="input" type="number" inputmode="numeric" min="0" max="24" name="hours" value="${Math.floor(cur.target / 60)}" aria-label="Số giờ"><em>giờ</em>
+        <input class="input" type="number" inputmode="numeric" min="0" max="59" step="5" name="mins" value="${cur.target % 60}" aria-label="Số phút"><em>phút</em></div></div>
+      <div class="field" data-cnt><span>Mỗi ngày</span><div class="amount">
+        <input class="input" type="number" inputmode="numeric" min="1" max="99" name="count" value="${cur.target}" aria-label="Số lần"><em>lần</em></div></div>
+      <p class="err" data-err></p>
+      <div class="btn-row"><button class="btn primary" type="submit">${isNew ? 'Thêm mục tiêu' : 'Lưu'}</button>
+        ${isNew ? '' : '<button class="btn danger" type="button" data-del>Xóa mục tiêu</button>'}
+        <button class="btn" type="button" data-back>Quay lại</button></div></form>`;
+    openSheet(isNew ? 'Mục tiêu mới' : 'Sửa mục tiêu', body, sheet => {
+      const f = $('#goal-form', sheet);
+      const kind = () => (typeById(f.type.value) || {}).kind;
+      const sync = () => { const d = kind() === 'duration'; $('[data-dur]', sheet).hidden = !d; $('[data-cnt]', sheet).hidden = d; };
+      f.type.addEventListener('change', sync);
+      sync();
+      sheet.addEventListener('click', ev => {
+        const b = ev.target.closest('button');
+        if (!b) return;
+        if (b.hasAttribute('data-back')) openGoalsSheet();
+        else if (b.hasAttribute('data-del')) {
+          db.goals = db.goals.filter(g => g.id !== goal.id);
+          save(); render(); openGoalsSheet(); toast('Đã xóa mục tiêu');
+        }
+      });
+      f.addEventListener('submit', ev => {
+        ev.preventDefault();
+        const err = $('[data-err]', sheet);
+        const t = typeById(f.type.value);
+        if (!t) { err.textContent = 'Hãy chọn một hoạt động.'; return; }
+        const dir = f.querySelector('input[name="dir"]:checked').value;
+        const target = t.kind === 'duration'
+          ? (parseInt(f.hours.value, 10) || 0) * 60 + (parseInt(f.mins.value, 10) || 0)
+          : parseInt(f.count.value, 10) || 0;
+        if (target <= 0) { err.textContent = 'Hãy nhập mức lớn hơn 0.'; return; }
+        if (t.kind === 'duration' && target > 24 * 60) { err.textContent = 'Một ngày chỉ có 24 giờ thôi 🙂'; return; }
+        if (db.goals.some(g => g.typeId === t.id && (isNew || g.id !== goal.id))) { err.textContent = 'Hoạt động này đã có mục tiêu. Hãy sửa mục tiêu cũ.'; return; }
+        if (isNew) db.goals.push({ id: uid(), typeId: t.id, dir, target });
+        else Object.assign(goal, { typeId: t.id, dir, target });
+        if (!t.enabled) t.enabled = true;
+        save(); render(); openGoalsSheet();
+        toast(isNew ? `🎯 Đã thêm mục tiêu ${t.name}` : 'Đã lưu');
+      });
+    });
+  }
+
   /* ---- Quản lý loại hoạt động ---- */
   function openTypesSheet() {
     const rows = db.types.map((t, i) => `
@@ -825,7 +1130,7 @@
         const d = JSON.parse(reader.result);
         if (!isValidData(d)) throw new Error('bad');
         if (!confirm(`Khôi phục ${d.entries.length} mục và ${d.types.length} loại hoạt động? Dữ liệu hiện tại trên máy này sẽ bị thay thế.`)) return;
-        db = d; save(); closeSheet(); render(); toast('Đã khôi phục dữ liệu');
+        db = normalize(d); save(); closeSheet(); render(); toast('Đã khôi phục dữ liệu');
       } catch (e) { toast('File không hợp lệ'); }
     };
     reader.readAsText(file);
@@ -853,6 +1158,8 @@
     if (document.hidden) return;
     if (startOfDay(Date.now()) !== state.renderedDay) { render(); return; }
     const now = Date.now();
+    // Cập nhật tiến độ mục tiêu mỗi phút khi đang chạy một hoạt động
+    if (state.tab === 'log' && db.goals.length && new Date(now).getSeconds() === 0 && running()) { render(); return; }
     $$('[data-since]').forEach(el => { el.textContent = fmtClock(now - Number(el.dataset.since)); });
   }
   setInterval(tick, 1000);
@@ -872,6 +1179,9 @@
     calDay: el => { state.calDay = Number(el.dataset.day); render(); },
     range: el => { const r = el.dataset.r; state.range = r === 'all' ? 'all' : Number(r); saveUi(); render(); },
     statType: el => openTypeStats(el.dataset.id),
+    goals: () => openGoalsSheet(),
+    coachDone: () => { state.coachSeen = startOfDay(Date.now()); saveUi(); render(); },
+    coachOpen: () => { state.coachSeen = null; saveUi(); render(); },
   };
   $('#view').addEventListener('click', ev => {
     const el = ev.target.closest('[data-act]');
@@ -893,5 +1203,5 @@
   }
 
   // Dùng khi kiểm thử
-  window.__nktg = { get db() { return db; }, set db(v) { db = v; save(); render(); } };
+  window.__nktg = { get db() { return db; }, set db(v) { db = normalize(v); save(); render(); } };
 })();

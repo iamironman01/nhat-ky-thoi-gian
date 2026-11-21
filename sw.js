@@ -1,5 +1,5 @@
 // Cho phép dùng app khi không có mạng. Luôn thử lấy bản mới trước, mất mạng thì dùng bản đã lưu.
-const CACHE = 'nktg-v1';
+const CACHE = 'nktg-v2';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest',
   './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 
