@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Nhật ký">
+<meta name="description" content="Bấm một nút để ghi lại bạn đang làm gì, xem mỗi ngày thời gian đi đâu.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Nhật ký thời gian</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="view" aria-live="polite"></main>
+
+<nav class="tabbar" aria-label="Điều hướng">
+  <button data-tab="log">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.5" class="fill"/></svg>
+    <span>Ghi nhận</span>
+  </button>
+  <button data-tab="timeline">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3 4v4h4"/><path d="M12 7.5V12l3 2"/></svg>
+    <span>Dòng thời gian</span>
+  </button>
+  <button data-tab="calendar">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+    <span>Lịch</span>
+  </button>
+  <button data-tab="stats">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V12M10 20V5M15 20v-9M20 20V8"/></svg>
+    <span>Thống kê</span>
+  </button>
+</nav>
+
+<div id="sheet-root"></div>
+<div id="toast" role="status"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
