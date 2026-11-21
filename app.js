@@ -52,7 +52,13 @@
         id: t[0], name: t[1], emoji: t[2], kind: t[3], enabled: true, color: PALETTE[i % PALETTE.length],
       })),
       entries: [],
+      goals: [],
     };
+  }
+  function normalize(d) {
+    if (!Array.isArray(d.goals)) d.goals = [];
+    d.goals = d.goals.filter(g => g && typeof g.typeId === 'string' && (g.dir === 'min' || g.dir === 'max') && g.target > 0);
+    return d;
   }
   function isValidData(d) {
     return d && Array.isArray(d.types) && Array.isArray(d.entries) &&
@@ -64,7 +70,7 @@
       const raw = localStorage.getItem(STORE_KEY);
       if (raw) {
         const d = JSON.parse(raw);
-        if (isValidData(d)) return d;
+        if (isValidData(d)) return normalize(d);
       }
     } catch (e) { /* bỏ qua, dùng dữ liệu mới */ }
     return freshData();
@@ -75,7 +81,7 @@
     catch (e) { toast('⚠️ Không lưu được dữ liệu trên máy này'); }
   }
   const ui = (() => { try { return JSON.parse(localStorage.getItem(UI_KEY)) || {}; } catch (e) { return {}; } })();
-  function saveUi() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: state.tab, range: state.range })); } catch (e) { /* không sao */ } }
+  function saveUi() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: state.tab, range: state.range, coachSeen: state.coachSeen })); } catch (e) { /* không sao */ } }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   /* ============ Tiện ích ============ */
