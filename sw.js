@@ -1,6 +1,6 @@
 // Cho phép dùng app khi không có mạng. Luôn thử lấy bản mới trước, mất mạng thì dùng bản đã lưu.
-const CACHE = 'nktg-v2';
-const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest',
+const CACHE = 'nktg-v3';
+const ASSETS = ['./', './index.html', './style.css', './app.js', './config.js', './vendor/supabase-2.119.0.js', './manifest.webmanifest',
   './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

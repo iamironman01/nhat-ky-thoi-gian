@@ -57,6 +57,8 @@
   }
   function normalize(d) {
     if (!Array.isArray(d.goals)) d.goals = [];
+    if (!d.sync || typeof d.sync !== 'object') d.sync = {};
+    if (!d.sync.dirty || typeof d.sync.dirty !== 'object') d.sync.dirty = {};
     d.goals = d.goals.filter(g => g && typeof g.typeId === 'string' && (g.dir === 'min' || g.dir === 'max') && g.target > 0);
     return d;
   }
@@ -73,13 +75,53 @@
         if (isValidData(d)) return normalize(d);
       }
     } catch (e) { /* bỏ qua, dùng dữ liệu mới */ }
-    return freshData();
+    return normalize(freshData());
   }
   let db = loadData();
-  function save() {
+  // Cấu hình đồng bộ (đọc từ config.js)
+  const CFG = window.NKTG_CONFIG || {};
+  const SYNC_ENABLED = !!(CFG.supabaseUrl && CFG.supabaseKey);
+  const TABLE = 'nktg_items';
+  const sync = { client: null, session: null, busy: false, again: false, timer: null, status: 'off', last: null, error: '' };
+  function persist() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); }
     catch (e) { toast('⚠️ Không lưu được dữ liệu trên máy này'); }
   }
+  // Mọi thay đổi dữ liệu đều đi qua save(): ghi nhận mục nào đã đổi để đồng bộ, rồi lưu
+  function save() {
+    trackChanges();
+    persist();
+    scheduleSync();
+  }
+
+  /* ============ Theo dõi thay đổi (phục vụ đồng bộ) ============ */
+  const KINDS = [['type', 'types'], ['entry', 'entries'], ['goal', 'goals']];
+  const FIELD = { type: 'types', entry: 'entries', goal: 'goals' };
+  const snap = new Map();
+  function itemJson(kind, it, i) {
+    const { u, ...rest } = it;
+    if (kind === 'type') rest.order = i;
+    return JSON.stringify(rest);
+  }
+  function snapAll() {
+    snap.clear();
+    for (const [k, f] of KINDS) db[f].forEach((it, i) => snap.set(k + ':' + it.id, itemJson(k, it, i)));
+  }
+  function trackChanges() {
+    const now = Date.now();
+    const seen = new Set();
+    for (const [k, f] of KINDS) db[f].forEach((it, i) => {
+      const key = k + ':' + it.id;
+      seen.add(key);
+      const j = itemJson(k, it, i);
+      if (snap.get(key) !== j) { snap.set(key, j); it.u = now; db.sync.dirty[key] = now; }
+    });
+    for (const key of Array.from(snap.keys())) {
+      if (!seen.has(key)) { snap.delete(key); db.sync.dirty[key] = now; }
+    }
+  }
+  function reloadDb() { db = loadData(); snapAll(); }
+  snapAll();
   const ui = (() => { try { return JSON.parse(localStorage.getItem(UI_KEY)) || {}; } catch (e) { return {}; } })();
   function saveUi() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: state.tab, range: state.range, coachSeen: state.coachSeen })); } catch (e) { /* không sao */ } }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
@@ -421,7 +463,7 @@
     const tracked = sumMap(totals);
     const elapsed = now - d0;
 
-    let h = `<header class="page-head"><div><h1>Hôm nay</h1><p class="sub">${esc(fmtDayLong(now))}</p></div>
+    let h = `<header class="page-head"><div><h1>Hôm nay</h1><p class="sub">${esc(fmtDayLong(now))}</p>${SYNC_ENABLED ? `<button class="sync-line" data-act="sync">${syncLabel()}</button>` : ''}</div>
       <div class="head-actions"><button class="round-btn" data-act="goals" aria-label="Mục tiêu">🎯</button>
       <button class="round-btn" data-act="types" aria-label="Quản lý loại hoạt động">${ICON_SLIDERS}</button></div></header>`;
 
@@ -1015,8 +1057,9 @@
       <div class="card">${rows}</div>
       <div class="btn-row"><button class="btn primary" data-new>＋ Thêm loại mới</button></div>
       <h2 class="section-title">Dữ liệu</h2>
-      <p class="note" style="padding:0 4px 10px">Dữ liệu chỉ lưu trên trình duyệt của máy này. Nên sao lưu định kỳ.</p>
+      <p class="note" style="padding:0 4px 10px">${sync.session ? 'Dữ liệu đang được đồng bộ lên mạng. Vẫn nên thỉnh thoảng sao lưu ra file.' : 'Dữ liệu chỉ lưu trên trình duyệt của máy này. Bật đồng bộ để dùng trên nhiều máy, hoặc sao lưu định kỳ.'}</p>
       <div class="btn-row" style="margin-top:0">
+        ${SYNC_ENABLED ? '<button class="btn" data-sync>☁️ Đồng bộ giữa các máy</button>' : ''}
         <button class="btn" data-export>⬇️ Sao lưu ra file</button>
         <button class="btn" data-import>⬆️ Khôi phục từ file</button>
         <button class="btn danger" data-wipe>Xóa toàn bộ dữ liệu</button>
@@ -1034,10 +1077,12 @@
         } else if (b.dataset.edit) openTypeForm(typeById(b.dataset.edit));
         else if (b.hasAttribute('data-new')) openTypeForm(null);
         else if (b.hasAttribute('data-export')) exportData();
+        else if (b.hasAttribute('data-sync')) openSyncSheet();
         else if (b.hasAttribute('data-import')) $('[data-file]', sheet).click();
         else if (b.hasAttribute('data-wipe')) {
-          if (confirm('Xóa TOÀN BỘ dữ liệu đã ghi và đưa về mặc định? Không hoàn tác được.')) {
-            db = freshData(); save(); closeSheet(); render(); toast('Đã xóa toàn bộ dữ liệu');
+          if (confirm(`Xóa TOÀN BỘ dữ liệu đã ghi và đưa về mặc định?${sync.session ? ' Dữ liệu trên các máy đã đồng bộ cũng bị xóa.' : ''} Không hoàn tác được.`)) {
+            const keep = db.sync; db = normalize(freshData()); db.sync = keep;
+            save(); closeSheet(); render(); toast('Đã xóa toàn bộ dữ liệu');
           }
         }
       });
@@ -1113,7 +1158,8 @@
   }
 
   function exportData() {
-    const blob = new Blob([JSON.stringify(db, null, 1)], { type: 'application/json' });
+    const { sync: _s, ...plain } = db;
+    const blob = new Blob([JSON.stringify(plain, null, 1)], { type: 'application/json' });
     const a = document.createElement('a');
     const d = new Date();
     a.href = URL.createObjectURL(blob);
@@ -1130,10 +1176,261 @@
         const d = JSON.parse(reader.result);
         if (!isValidData(d)) throw new Error('bad');
         if (!confirm(`Khôi phục ${d.entries.length} mục và ${d.types.length} loại hoạt động? Dữ liệu hiện tại trên máy này sẽ bị thay thế.`)) return;
-        db = normalize(d); save(); closeSheet(); render(); toast('Đã khôi phục dữ liệu');
+        const keep = db.sync; db = normalize(d); db.sync = keep;
+        save(); closeSheet(); render(); toast('Đã khôi phục dữ liệu');
       } catch (e) { toast('File không hợp lệ'); }
     };
     reader.readAsText(file);
+  }
+
+  /* ============ Đồng bộ qua Supabase ============ */
+
+  function syncLabel() {
+    if (!SYNC_ENABLED) return '';
+    if (!sync.session) return '☁️ Chưa bật đồng bộ';
+    const pending = Object.keys(db.sync.dirty).length;
+    if (sync.status === 'syncing') return '🔄 Đang đồng bộ…';
+    if (sync.status === 'offline') return `📴 Mất mạng${pending ? ` · ${pending} thay đổi chờ gửi` : ''}`;
+    if (sync.status === 'error') return '⚠️ Lỗi đồng bộ, bấm để xem';
+    if (sync.last) return `☁️ Đã đồng bộ lúc ${fmtTime(sync.last)}`;
+    return '☁️ Đã bật đồng bộ';
+  }
+  function updateSyncUi() {
+    $$('.sync-line').forEach(el => { el.textContent = syncLabel(); });
+    const box = $('[data-sync-status]');
+    if (box) box.innerHTML = syncStatusHtml();
+  }
+  function loadSdk() {
+    if (window.supabase && window.supabase.createClient) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'vendor/supabase-2.119.0.js';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Không tải được thư viện đồng bộ'));
+      document.head.appendChild(s);
+    });
+  }
+  async function initSync() {
+    if (!SYNC_ENABLED) return;
+    try {
+      await loadSdk();
+      sync.client = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseKey, {
+        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: 'nktg-auth' },
+      });
+      const { data } = await sync.client.auth.getSession();
+      sync.session = data.session;
+      sync.client.auth.onAuthStateChange((event, session) => {
+        sync.session = session;
+        if (!session) sync.status = 'off';
+        updateSyncUi();
+        if (event === 'SIGNED_IN') syncNow();
+      });
+      updateSyncUi();
+      if (sync.session) syncNow();
+    } catch (e) {
+      sync.status = 'offline';
+      sync.error = e.message || String(e);
+    }
+  }
+  function scheduleSync(delay = 1500) {
+    if (!sync.session) return;
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(syncNow, delay);
+  }
+  async function syncNow() {
+    if (!sync.client || !sync.session) return;
+    if (sync.busy) { sync.again = true; return; }
+    sync.busy = true;
+    sync.status = 'syncing';
+    updateSyncUi();
+    try {
+      const uid = sync.session.user.id;
+      if (db.sync.user !== uid) {
+        // Lần đầu tài khoản này dùng trên máy: tải về trước, rồi gửi toàn bộ dữ liệu đang có
+        db.sync.user = uid;
+        db.sync.lastPull = null;
+        for (const [k, f] of KINDS) for (const it of db[f]) {
+          const key = k + ':' + it.id;
+          if (!(key in db.sync.dirty)) db.sync.dirty[key] = it.u || 0;
+        }
+        persist();
+      }
+      await pullRemote();
+      await pushLocal(uid);
+      sync.status = 'idle';
+      sync.last = Date.now();
+      sync.error = '';
+    } catch (e) {
+      sync.error = (e && e.message) || String(e);
+      sync.status = (navigator.onLine === false || /fetch|network|load failed/i.test(sync.error)) ? 'offline' : 'error';
+    } finally {
+      sync.busy = false;
+      updateSyncUi();
+      if (sync.again) { sync.again = false; scheduleSync(300); }
+    }
+  }
+  async function pullRemote() {
+    let since = db.sync.lastPull || null;
+    for (let page = 0; page < 100; page++) {
+      let q = sync.client.from(TABLE).select('kind,id,data,deleted,updated_at,synced_at')
+        .order('synced_at', { ascending: true }).limit(1000);
+      if (since) q = q.gt('synced_at', since);
+      const { data, error } = await q;
+      if (error) throw error;
+      if (!data || !data.length) break;
+      applyRemote(data);
+      since = data[data.length - 1].synced_at;
+      db.sync.lastPull = since;
+      persist();
+      if (data.length < 1000) break;
+    }
+  }
+  function validRemote(kind, d) {
+    if (!d || typeof d !== 'object') return false;
+    if (kind === 'type') return typeof d.name === 'string' && (d.kind === 'duration' || d.kind === 'instant');
+    if (kind === 'entry') return typeof d.typeId === 'string' && typeof d.start === 'number' && (d.k === 'd' || d.k === 'i');
+    if (kind === 'goal') return typeof d.typeId === 'string' && (d.dir === 'min' || d.dir === 'max') && d.target > 0;
+    return false;
+  }
+  function applyRemote(rows) {
+    let changed = false;
+    for (const r of rows) {
+      const f = FIELD[r.kind];
+      if (!f || typeof r.id !== 'string') continue;
+      const key = r.kind + ':' + r.id;
+      const arr = db[f];
+      const idx = arr.findIndex(x => x.id === r.id);
+      const localU = idx >= 0 ? (arr[idx].u || 0) : (key in db.sync.dirty ? db.sync.dirty[key] : -1);
+      const ru = Number(r.updated_at) || 0;
+      if (ru < localU) continue; // bản trên máy này mới hơn, giữ lại và sẽ gửi đi
+      if (r.deleted) {
+        if (idx >= 0) { arr.splice(idx, 1); changed = true; }
+      } else {
+        if (!validRemote(r.kind, r.data)) continue;
+        const item = { ...r.data, id: r.id, u: ru };
+        if (idx >= 0) arr[idx] = item; else arr.push(item);
+        changed = true;
+      }
+      delete db.sync.dirty[key];
+    }
+    if (!changed) return;
+    db.types.sort((a, b) => (a.order ?? 1e9) - (b.order ?? 1e9));
+    snapAll();
+    // Hai máy cùng bấm giờ hai việc khác nhau: giữ việc bắt đầu sau cùng
+    const runs = db.entries.filter(e => e.k === 'd' && e.end === null).sort((a, b) => a.start - b.start);
+    for (let i = 0; i < runs.length - 1; i++) runs[i].end = Math.max(runs[i].start + 1000, runs[i + 1].start);
+    trackChanges();
+    persist();
+    render();
+  }
+  async function pushLocal(uid) {
+    const keys = Object.keys(db.sync.dirty);
+    for (let i = 0; i < keys.length; i += 500) {
+      const batch = keys.slice(i, i + 500);
+      const sent = batch.map(k => db.sync.dirty[k]);
+      const rows = batch.map(key => {
+        const cut = key.indexOf(':');
+        const kind = key.slice(0, cut), id = key.slice(cut + 1);
+        const arr = db[FIELD[kind]] || [];
+        const idx = arr.findIndex(x => x.id === id);
+        if (idx >= 0) {
+          const { u, ...data } = arr[idx];
+          if (kind === 'type') data.order = idx;
+          return { user_id: uid, kind, id, data, deleted: false, updated_at: u || 0 };
+        }
+        return { user_id: uid, kind, id, data: null, deleted: true, updated_at: db.sync.dirty[key] || Date.now() };
+      });
+      const { error } = await sync.client.from(TABLE).upsert(rows, { onConflict: 'user_id,kind,id' });
+      if (error) throw error;
+      batch.forEach((k, j) => { if (db.sync.dirty[k] === sent[j]) delete db.sync.dirty[k]; });
+      persist();
+    }
+  }
+
+  function viErr(e) {
+    const m = (e && e.message) || String(e);
+    if (/invalid login credentials/i.test(m)) return 'Sai email hoặc mật khẩu.';
+    if (/email not confirmed/i.test(m)) return 'Email chưa được xác nhận. Mở hộp thư, bấm link xác nhận rồi đăng nhập lại.';
+    if (/already registered|already been registered/i.test(m)) return 'Email này đã có tài khoản. Hãy bấm Đăng nhập.';
+    if (/password.*(at least|6)/i.test(m)) return 'Mật khẩu cần ít nhất 6 ký tự.';
+    if (/invalid.*email|email.*invalid/i.test(m)) return 'Email chưa đúng định dạng.';
+    if (/rate limit|too many/i.test(m)) return 'Thử quá nhiều lần, đợi vài phút rồi thử lại.';
+    if (/failed to fetch|network/i.test(m)) return 'Không kết nối được. Kiểm tra mạng rồi thử lại.';
+    return m;
+  }
+  function syncStatusHtml() {
+    const pending = Object.keys(db.sync.dirty).length;
+    let h = `<div class="card sync-card"><div class="row-static"><span class="avatar">☁️</span><span class="row-main">
+      <span class="row-title">${esc(sync.session.user.email || 'Tài khoản')}</span><span class="row-sub">${esc(syncLabel())}</span></span></div>`;
+    h += `<div class="row-static"><span class="row-main"><span class="row-sub">Thay đổi chờ gửi: <b>${pending}</b></span></span></div>`;
+    if (sync.status === 'error' && sync.error) h += `<p class="err" style="padding:0 14px 12px">${esc(viErr({ message: sync.error }))}</p>`;
+    return h + '</div>';
+  }
+  function openSyncSheet() {
+    if (!SYNC_ENABLED) { toast('Chưa cài đặt máy chủ đồng bộ'); return; }
+    if (!sync.client) {
+      openSheet('Đồng bộ', `<p class="note">Chưa kết nối được dịch vụ đồng bộ (có thể do mất mạng). Thử lại sau.</p>
+        <div class="btn-row"><button class="btn primary" data-retry>Thử lại</button></div>`, sheet => {
+        $('[data-retry]', sheet).addEventListener('click', async () => { await initSync(); openSyncSheet(); });
+      });
+      return;
+    }
+    if (sync.session) {
+      openSheet('Đồng bộ', `<div data-sync-status>${syncStatusHtml()}</div>
+        <p class="note" style="padding:12px 4px 0">Đăng nhập cùng tài khoản này trên điện thoại và máy tính. Ghi ở máy nào thì máy kia sẽ có khi mở app, hoặc trong vòng 1 phút nếu đang mở. Mất mạng vẫn dùng bình thường, có mạng lại sẽ tự gửi.</p>
+        <div class="btn-row"><button class="btn primary" data-now>🔄 Đồng bộ ngay</button><button class="btn danger" data-out>Đăng xuất</button></div>`, sheet => {
+        $('[data-now]', sheet).addEventListener('click', () => syncNow());
+        $('[data-out]', sheet).addEventListener('click', async () => {
+          if (!confirm('Đăng xuất khỏi đồng bộ? Dữ liệu trên máy này vẫn được giữ.')) return;
+          await sync.client.auth.signOut();
+          sync.session = null; sync.status = 'off';
+          closeSheet(); render(); toast('Đã đăng xuất');
+        });
+      });
+      return;
+    }
+    openSheet('Bật đồng bộ', `<form id="auth-form" novalidate>
+      <p class="note" style="padding:0 4px 14px">Dùng <b>cùng email và mật khẩu</b> trên điện thoại và máy tính để dữ liệu tự đồng bộ. Lần đầu thì bấm <b>Tạo tài khoản</b>, máy sau thì bấm <b>Đăng nhập</b>.</p>
+      <label class="field"><span>Email</span><input class="input" type="email" name="email" autocomplete="email" inputmode="email" required></label>
+      <label class="field"><span>Mật khẩu (ít nhất 6 ký tự)</span><input class="input" type="password" name="password" autocomplete="current-password" minlength="6" required></label>
+      <p class="err" data-err></p>
+      <div class="btn-row"><button class="btn primary" type="submit" data-mode="in">Đăng nhập</button>
+        <button class="btn" type="submit" data-mode="up">Tạo tài khoản</button></div></form>`, sheet => {
+      const f = $('#auth-form', sheet);
+      let mode = 'in';
+      $$('button[data-mode]', sheet).forEach(b => b.addEventListener('click', () => { mode = b.dataset.mode; }));
+      f.addEventListener('submit', async ev => {
+        ev.preventDefault();
+        const err = $('[data-err]', sheet);
+        const email = f.email.value.trim(), password = f.password.value;
+        if (!email || password.length < 6) { err.textContent = 'Nhập email và mật khẩu ít nhất 6 ký tự.'; return; }
+        err.textContent = '';
+        $$('button', f).forEach(b => { b.disabled = true; });
+        try {
+          if (mode === 'up') {
+            const { data, error } = await sync.client.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } });
+            if (error) throw error;
+            if (!data.session) {
+              openSheet('Xác nhận email', `<p class="note" style="font-size:16px;line-height:1.5">📧 Đã gửi thư xác nhận tới <b>${esc(email)}</b>.<br><br>Mở hộp thư (xem cả mục Spam), bấm link xác nhận, rồi quay lại app bấm <b>Đăng nhập</b>.</p>
+                <div class="btn-row"><button class="btn primary" data-close>Đã hiểu</button></div>`);
+              $$('#sheet-root [data-close]').forEach(b => b.addEventListener('click', closeSheet));
+              return;
+            }
+          } else {
+            const { error } = await sync.client.auth.signInWithPassword({ email, password });
+            if (error) throw error;
+          }
+          const { data } = await sync.client.auth.getSession();
+          sync.session = data.session;
+          closeSheet(); render(); toast('☁️ Đã bật đồng bộ');
+          syncNow();
+        } catch (e) {
+          err.textContent = viErr(e);
+        } finally {
+          $$('button', f).forEach(b => { b.disabled = false; });
+        }
+      });
+    });
   }
 
   /* ============ Toast ============ */
@@ -1163,9 +1460,11 @@
     $$('[data-since]').forEach(el => { el.textContent = fmtClock(now - Number(el.dataset.since)); });
   }
   setInterval(tick, 1000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { db = loadData(); render(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { reloadDb(); render(); syncNow(); } });
   // Đồng bộ giữa các tab trình duyệt trên cùng một máy
-  window.addEventListener('storage', ev => { if (ev.key === STORE_KEY) { db = loadData(); render(); } });
+  window.addEventListener('storage', ev => { if (ev.key === STORE_KEY) { reloadDb(); render(); } });
+  window.addEventListener('online', () => syncNow());
+  setInterval(() => { if (!document.hidden) syncNow(); }, 60000);
 
   const ACTIONS = {
     tap: el => { const t = typeById(el.dataset.id); if (t) tapType(t, el); },
@@ -1182,6 +1481,7 @@
     goals: () => openGoalsSheet(),
     coachDone: () => { state.coachSeen = startOfDay(Date.now()); saveUi(); render(); },
     coachOpen: () => { state.coachSeen = null; saveUi(); render(); },
+    sync: () => openSyncSheet(),
   };
   $('#view').addEventListener('click', ev => {
     const el = ev.target.closest('[data-act]');
@@ -1197,6 +1497,7 @@
   }));
 
   render();
+  initSync();
 
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
